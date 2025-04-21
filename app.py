@@ -1,9 +1,10 @@
 from flask import Flask, jsonify, request
 import mysql.connector
 import heapq
+from flask_cors import CORS
 
 app = Flask(__name__)
-
+CORS(app)
 # -------------------- DB Connection --------------------
 def connect_db():
     return mysql.connector.connect(
@@ -25,13 +26,13 @@ def get_locations():
     locations = [{"id": row[0], "name": row[1]} for row in rows]
     return jsonify({"locations": locations})
 
-
 # -------------------- Build Graph from DB --------------------
 def get_graph_from_db():
     db = connect_db()
     cursor = db.cursor()
     cursor.execute("SELECT from_location, to_location, total_distance FROM paths")
     rows = cursor.fetchall()
+    cursor.close()
     db.close()
 
     graph = {}
@@ -73,6 +74,7 @@ def a_star(graph, start, end):
 
 
 # -------------------- POST /find_path --------------------
+
 @app.route("/find_path", methods=["POST"])
 def find_path():
     data = request.get_json()
@@ -83,25 +85,69 @@ def find_path():
         return jsonify({"error": "Start and End IDs required"}), 400
 
     graph = get_graph_from_db()
-    path, total_distance = a_star(graph, start, end)
+    path, _ = a_star(graph, start, end)
 
-    if not path:
+    if not path or len(path) < 2:
         return jsonify({"error": "No path found"}), 404
 
-    # Get names of locations in the path
     db = connect_db()
     cursor = db.cursor()
+
+    # Get names of locations
     cursor.execute("SELECT location_id, name FROM locations")
     location_map = dict(cursor.fetchall())
+
+    all_steps = []
+    total_distance = 0
+
+    for i in range(len(path) - 1):
+        from_node = path[i]
+        to_node = path[i + 1]
+        
+        print(f"Searching path_id for: {from_node} -> {to_node}")
+
+        # Get path_id for the segment (either direction)
+        cursor.execute("""
+            SELECT path_id FROM paths
+            WHERE (from_location = %s AND to_location = %s)
+               OR (from_location = %s AND to_location = %s)
+            LIMIT 1
+        """, (from_node, to_node, to_node, from_node))
+        result = cursor.fetchone()
+        
+
+        if result:
+            path_id = result[0]
+            print("Found path_id:", path_id)
+            # Fetch all steps for this path_id
+            cursor.execute("""
+                SELECT instruction, distance FROM path_steps
+                WHERE path_id = %s ORDER BY step_order
+            """, (path_id,))
+            step_rows = cursor.fetchall()
+            print("Fetched steps:", step_rows)
+  
+
+            for instruction, distance in step_rows:
+                all_steps.append({
+                    "instruction": instruction,
+                    "distance": distance
+                })
+                total_distance += distance
+        else:
+            # fallback if no path_id found
+            all_steps.append({
+                "instruction": f"Move from {location_map[from_node]} to {location_map[to_node]}",
+                "distance": 0
+            })
+
     db.close()
 
-    path_names = [location_map[node] for node in path]
-
     return jsonify({
-        "path": path_names,
-        "distance": total_distance
+        "path": [location_map[node] for node in path],
+        "total_distance": total_distance,
+        "steps": all_steps
     })
-
 
 # -------------------- Home Route --------------------
 @app.route("/")
