@@ -5,12 +5,13 @@ from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
 # -------------------- DB Connection --------------------
 def connect_db():
     return mysql.connector.connect(
         host="localhost",
         user="root",               # Change if your username is different
-        password="root",   # ← REPLACE with your actual MySQL password
+        password="root",           # ← REPLACE with your actual MySQL password
         database="smart_campus"    # ← Use your actual DB name
     )
 
@@ -41,13 +42,12 @@ def get_graph_from_db():
             graph[from_node] = []
         if to_node not in graph:
             graph[to_node] = []
-        
+
         # Undirected graph: both directions
         graph[from_node].append((to_node, dist))
         graph[to_node].append((from_node, dist))
 
     return graph
-
 
 # -------------------- A* Pathfinding Logic --------------------
 def a_star(graph, start, end):
@@ -72,9 +72,7 @@ def a_star(graph, start, end):
 
     return None, float('inf')
 
-
 # -------------------- POST /find_path --------------------
-
 @app.route("/find_path", methods=["POST"])
 def find_path():
     data = request.get_json()
@@ -85,75 +83,93 @@ def find_path():
         return jsonify({"error": "Start and End IDs required"}), 400
 
     graph = get_graph_from_db()
-    path, _ = a_star(graph, start, end)
 
-    if not path or len(path) < 2:
-        return jsonify({"error": "No path found"}), 404
+    # ---- Find all possible paths (simple DFS, not full optimization) ----
+    def dfs(current, end, visited, path, all_paths):
+        visited.add(current)
+        path.append(current)
 
+        if current == end:
+            all_paths.append(list(path))
+        else:
+            for neighbor, _ in graph.get(current, []):
+                if neighbor not in visited:
+                    dfs(neighbor, end, visited, path, all_paths)
+
+        path.pop()
+        visited.remove(current)
+
+    all_possible_paths = []
+    dfs(start, end, set(), [], all_possible_paths)
+
+    if not all_possible_paths:
+        return jsonify({"error": "No paths found"}), 404
+
+    # ---- Now calculate distance for each path ----
     db = connect_db()
     cursor = db.cursor()
 
-    # Get names of locations
+    # Fetch location names
     cursor.execute("SELECT location_id, name FROM locations")
     location_map = dict(cursor.fetchall())
 
-    all_steps = []
-    total_distance = 0
+    paths_info = []
 
-    for i in range(len(path) - 1):
-        from_node = path[i]
-        to_node = path[i + 1]
-        
-        print(f"Searching path_id for: {from_node} -> {to_node}")
+    for path in all_possible_paths:
+        path_info = {
+            "path": [location_map[node] for node in path],
+            "steps": [],
+            "total_distance": 0
+        }
 
-        # Get path_id for the segment (either direction)
-        cursor.execute("""
-            SELECT path_id FROM paths
-            WHERE (from_location = %s AND to_location = %s)
-               OR (from_location = %s AND to_location = %s)
-            LIMIT 1
-        """, (from_node, to_node, to_node, from_node))
-        result = cursor.fetchone()
-        
+        for i in range(len(path) - 1):
+            from_node = path[i]
+            to_node = path[i + 1]
 
-        if result:
-            path_id = result[0]
-            print("Found path_id:", path_id)
-            # Fetch all steps for this path_id
             cursor.execute("""
-                SELECT instruction, distance FROM path_steps
-                WHERE path_id = %s ORDER BY step_order
-            """, (path_id,))
-            step_rows = cursor.fetchall()
-            print("Fetched steps:", step_rows)
-  
+                SELECT path_id FROM paths
+                WHERE (from_location = %s AND to_location = %s)
+                   OR (from_location = %s AND to_location = %s)
+                LIMIT 1
+            """, (from_node, to_node, to_node, from_node))
+            result = cursor.fetchone()
 
-            for instruction, distance in step_rows:
-                all_steps.append({
-                    "instruction": instruction,
-                    "distance": distance
+            if result:
+                path_id = result[0]
+                # Fetch steps
+                cursor.execute("""
+                    SELECT instruction, distance FROM path_steps
+                    WHERE path_id = %s ORDER BY step_order
+                """, (path_id,))
+                step_rows = cursor.fetchall()
+
+                for instruction, distance in step_rows:
+                    path_info["steps"].append({
+                        "instruction": instruction,
+                        "distance": distance
+                    })
+                    path_info["total_distance"] += distance
+            else:
+                # fallback if no steps
+                path_info["steps"].append({
+                    "instruction": f"Move from {location_map[from_node]} to {location_map[to_node]}",
+                    "distance": 0
                 })
-                total_distance += distance
-        else:
-            # fallback if no path_id found
-            all_steps.append({
-                "instruction": f"Move from {location_map[from_node]} to {location_map[to_node]}",
-                "distance": 0
-            })
+
+        paths_info.append(path_info)
 
     db.close()
 
+    # ---- Now separate best path and other paths ----
+    paths_info.sort(key=lambda p: p["total_distance"])  # Sort by total distance
+
+    best_path = paths_info[0]
+    other_paths = paths_info[1:]
+
     return jsonify({
-        "path": [location_map[node] for node in path],
-        "total_distance": total_distance,
-        "steps": all_steps
+        "best_path": best_path,
+        "other_paths": other_paths
     })
-
-# -------------------- Home Route --------------------
-@app.route("/")
-def home():
-    return jsonify({"message": "Smart Campus backend is working!"})
-
 
 # -------------------- Start Server --------------------
 if __name__ == "__main__":
